@@ -1,0 +1,337 @@
+# Environment variable knowledge base
+# Maps packages to their required and optional env vars
+# Used by Ralph's scaffold-infra script to generate .env files
+
+# npm packages
+packages:
+  # Authentication
+  next-auth:
+    required:
+      - name: NEXTAUTH_SECRET
+        description: "Secret for signing tokens"
+        default: "dev-secret-change-me"
+      - name: NEXTAUTH_URL
+        description: "Canonical URL of the app"
+        default: "__DEVTUN_URL__"
+    optional:
+      - name: AUTH_GOOGLE_ID
+        description: "Google OAuth client ID"
+      - name: AUTH_GOOGLE_SECRET
+        description: "Google OAuth client secret"
+
+  # Database
+  prisma:
+    required:
+      - name: DATABASE_URL
+        description: "PostgreSQL connection string"
+        default: "postgresql://postgres:postgres@db:5432/${PROJECT_NAME}?schema=public"
+      - name: DATABASE_URL_TEST
+        description: "Test database connection string"
+        default: "postgresql://postgres:postgres@db:5432/${PROJECT_NAME}_test?schema=public"
+
+  "@prisma/client":
+    see: prisma
+
+  # AI Providers
+  ai:
+    required: []
+    optional:
+      - name: ANTHROPIC_API_KEY
+        description: "Anthropic API key for Claude models"
+      - name: OPENAI_API_KEY
+        description: "OpenAI API key"
+      - name: GOOGLE_GENERATIVE_AI_API_KEY
+        description: "Google AI API key"
+
+  "@ai-sdk/anthropic":
+    required:
+      - name: ANTHROPIC_API_KEY
+        description: "Anthropic API key"
+
+  "@ai-sdk/openai":
+    required:
+      - name: OPENAI_API_KEY
+        description: "OpenAI API key"
+
+  "@ai-sdk/google":
+    required:
+      - name: GOOGLE_GENERATIVE_AI_API_KEY
+        description: "Google AI API key"
+
+  "@ai-sdk/xai":
+    required:
+      - name: XAI_API_KEY
+        description: "xAI/Grok API key"
+
+  openai:
+    required:
+      - name: OPENAI_API_KEY
+        description: "OpenAI API key"
+
+  # Email
+  resend:
+    required:
+      - name: RESEND_API_KEY
+        description: "Resend API key"
+    optional:
+      - name: RESEND_WEBHOOK_SECRET
+        description: "Resend inbound webhook signing secret"
+
+  # Payments
+  "@paddle/paddle-node-sdk":
+    required:
+      - name: PADDLE_API_KEY
+        description: "Paddle API key"
+      - name: PADDLE_WEBHOOK_SECRET
+        description: "Paddle webhook signing secret"
+    optional:
+      - name: PADDLE_ENVIRONMENT
+        description: "Paddle environment"
+        default: "sandbox"
+
+  stripe:
+    required:
+      - name: STRIPE_SECRET_KEY
+        description: "Stripe secret key"
+      - name: STRIPE_WEBHOOK_SECRET
+        description: "Stripe webhook signing secret"
+    optional:
+      - name: NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY
+        description: "Stripe publishable key (client-side)"
+
+  # Storage
+  "@aws-sdk/client-s3":
+    required:
+      - name: S3_ENDPOINT
+        description: "S3-compatible endpoint URL"
+        default: "http://minio:9000"
+      - name: S3_ACCESS_KEY
+        description: "S3 access key"
+        default: "minioadmin"
+      - name: S3_SECRET_KEY
+        description: "S3 secret key"
+        default: "minioadmin"
+      - name: S3_BUCKET
+        description: "S3 bucket name"
+        default: "${PROJECT_NAME}-uploads"
+      - name: S3_REGION
+        description: "S3 region"
+        default: "us-east-1"
+
+  # Redis
+  ioredis:
+    required:
+      - name: REDIS_URL
+        description: "Redis connection string"
+        default: "redis://redis:6379"
+
+  redis:
+    see: ioredis
+
+  "@upstash/redis":
+    required:
+      - name: UPSTASH_REDIS_REST_URL
+        description: "Upstash Redis REST URL"
+      - name: UPSTASH_REDIS_REST_TOKEN
+        description: "Upstash Redis REST token"
+
+  # Next.js core
+  next:
+    optional:
+      - name: NODE_ENV
+        description: "Node environment"
+        default: "development"
+      - name: PORT
+        description: "Server port"
+        default: "3000"
+      - name: NEXT_PUBLIC_APP_URL
+        description: "Public-facing app URL"
+        default: "__DEVTUN_URL__"
+
+  # Monitoring
+  "@sentry/nextjs":
+    required:
+      - name: SENTRY_DSN
+        description: "Sentry DSN"
+      - name: SENTRY_AUTH_TOKEN
+        description: "Sentry auth token for source maps"
+
+  # Currency/FX
+  open-exchange-rates:
+    required:
+      - name: OPEN_EXCHANGE_RATES_APP_ID
+        description: "Open Exchange Rates API key"
+
+  # PDF
+  puppeteer:
+    optional:
+      - name: PUPPETEER_EXECUTABLE_PATH
+        description: "Path to Chrome/Chromium binary"
+        default: "/usr/bin/chromium-browser"
+
+# Go modules
+go_modules:
+  github.com/lib/pq:
+    required:
+      - name: DATABASE_URL
+        description: "PostgreSQL connection string"
+        default: "postgresql://postgres:postgres@db:5432/${PROJECT_NAME}?schema=public"
+      - name: DATABASE_URL_TEST
+        description: "Test database connection string"
+        default: "postgresql://postgres:postgres@db:5432/${PROJECT_NAME}_test?schema=public"
+
+  github.com/jackc/pgx:
+    see: github.com/lib/pq
+
+  github.com/go-redis/redis:
+    required:
+      - name: REDIS_URL
+        description: "Redis connection string"
+        default: "redis://redis:6379"
+
+  github.com/redis/go-redis:
+    see: github.com/go-redis/redis
+
+  github.com/aws/aws-sdk-go-v2:
+    required:
+      - name: S3_ENDPOINT
+        description: "S3-compatible endpoint URL"
+        default: "http://minio:9000"
+      - name: AWS_ACCESS_KEY_ID
+        description: "AWS/S3 access key"
+        default: "minioadmin"
+      - name: AWS_SECRET_ACCESS_KEY
+        description: "AWS/S3 secret key"
+        default: "minioadmin"
+      - name: S3_BUCKET
+        description: "S3 bucket name"
+        default: "${PROJECT_NAME}-uploads"
+      - name: AWS_REGION
+        description: "AWS region"
+        default: "us-east-1"
+
+  github.com/resend/resend-go:
+    required:
+      - name: RESEND_API_KEY
+        description: "Resend API key"
+
+  github.com/stripe/stripe-go:
+    required:
+      - name: STRIPE_SECRET_KEY
+        description: "Stripe secret key"
+      - name: STRIPE_WEBHOOK_SECRET
+        description: "Stripe webhook signing secret"
+
+# Python packages
+python_packages:
+  sqlalchemy:
+    required:
+      - name: DATABASE_URL
+        description: "SQLAlchemy connection string"
+        default: "postgresql://postgres:postgres@db:5432/${PROJECT_NAME}"
+      - name: DATABASE_URL_TEST
+        description: "Test database connection string"
+        default: "postgresql://postgres:postgres@db:5432/${PROJECT_NAME}_test"
+
+  psycopg2:
+    see: sqlalchemy
+
+  asyncpg:
+    see: sqlalchemy
+
+  django:
+    required:
+      - name: DATABASE_URL
+        description: "Database URL (parsed by dj-database-url)"
+        default: "postgresql://postgres:postgres@db:5432/${PROJECT_NAME}"
+      - name: SECRET_KEY
+        description: "Django secret key"
+        default: "dev-secret-change-me"
+      - name: ALLOWED_HOSTS
+        description: "Comma-separated allowed hosts"
+        default: "*"
+      - name: APP_URL
+        description: "Public-facing app URL"
+        default: "__DEVTUN_URL__"
+
+  flask:
+    required:
+      - name: DATABASE_URL
+        description: "Database URL"
+        default: "postgresql://postgres:postgres@db:5432/${PROJECT_NAME}"
+      - name: SECRET_KEY
+        description: "Flask secret key"
+        default: "dev-secret-change-me"
+      - name: APP_URL
+        description: "Public-facing app URL"
+        default: "__DEVTUN_URL__"
+
+  redis:
+    required:
+      - name: REDIS_URL
+        description: "Redis connection string"
+        default: "redis://redis:6379"
+
+  celery:
+    required:
+      - name: CELERY_BROKER_URL
+        description: "Celery broker URL"
+        default: "redis://redis:6379/0"
+
+  boto3:
+    required:
+      - name: S3_ENDPOINT
+        description: "S3-compatible endpoint URL"
+        default: "http://minio:9000"
+      - name: AWS_ACCESS_KEY_ID
+        description: "AWS/S3 access key"
+        default: "minioadmin"
+      - name: AWS_SECRET_ACCESS_KEY
+        description: "AWS/S3 secret key"
+        default: "minioadmin"
+      - name: S3_BUCKET
+        description: "S3 bucket name"
+        default: "${PROJECT_NAME}-uploads"
+
+  resend:
+    required:
+      - name: RESEND_API_KEY
+        description: "Resend API key"
+
+  stripe:
+    required:
+      - name: STRIPE_SECRET_KEY
+        description: "Stripe secret key"
+      - name: STRIPE_WEBHOOK_SECRET
+        description: "Stripe webhook signing secret"
+
+  anthropic:
+    required:
+      - name: ANTHROPIC_API_KEY
+        description: "Anthropic API key"
+
+  openai:
+    required:
+      - name: OPENAI_API_KEY
+        description: "OpenAI API key"
+
+# Service defaults for docker-compose
+services:
+  postgres:
+    env:
+      - name: POSTGRES_USER
+        default: "postgres"
+      - name: POSTGRES_PASSWORD
+        default: "postgres"
+      - name: POSTGRES_DB
+        default: "${PROJECT_NAME}"
+
+  minio:
+    env:
+      - name: MINIO_ROOT_USER
+        default: "minioadmin"
+      - name: MINIO_ROOT_PASSWORD
+        default: "minioadmin"
+
+  redis:
+    env: []

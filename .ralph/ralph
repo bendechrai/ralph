@@ -1,0 +1,587 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+ROOT="$(pwd)"
+PLAN="$ROOT/IMPLEMENTATION_PLAN.md"
+LOGS_DIR="$ROOT/.ralph/logs"
+
+PROGRESS_STEP=0
+PROGRESS_TOTAL=8
+progress() {
+  PROGRESS_STEP=$((PROGRESS_STEP + 1))
+  local filled=$((PROGRESS_STEP * 20 / PROGRESS_TOTAL))
+  local empty=$((20 - filled))
+  local bar=""
+  for ((j=0; j<filled; j++)); do bar+="#"; done
+  for ((j=0; j<empty; j++)); do bar+="."; done
+  printf '\r\033[K[%s] %s' "$bar" "$1" >&2
+}
+progress_done() {
+  printf '\r\033[K' >&2
+}
+
+gather_status() {
+  echo "=== RALPH STATUS REPORT ==="
+  echo "Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  echo ""
+
+  # -- Task Progress --
+  progress "Reading task progress..."
+  echo "--- TASK PROGRESS ---"
+  if [[ -f "$PLAN" ]]; then
+    local completed backlog total pct
+    completed=$(grep -c '^\- \[x\]' "$PLAN" 2>/dev/null || true)
+    completed=${completed:-0}
+    backlog=$(grep -c '^\- \[ \]' "$PLAN" 2>/dev/null || true)
+    backlog=${backlog:-0}
+    total=$((completed + backlog))
+    if [[ $total -gt 0 ]]; then
+      pct=$((completed * 100 / total))
+    else
+      pct=0
+    fi
+    echo "completed: $completed"
+    echo "backlog: $backlog"
+    echo "total: $total"
+    echo "percent_complete: $pct%"
+    echo ""
+
+    echo "--- TASK BREAKDOWN BY SPEC ---"
+    local current_spec="" spec_done=0 spec_todo=0
+
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^###\ (.+) ]]; then
+        if [[ -n "$current_spec" ]]; then
+          echo "  $current_spec: $spec_done done, $spec_todo remaining"
+        fi
+        current_spec="${BASH_REMATCH[1]}"
+        spec_done=0
+        spec_todo=0
+      elif [[ "$line" =~ ^\-\ \[x\] ]]; then
+        spec_done=$((spec_done + 1))
+      elif [[ "$line" =~ ^\-\ \[\ \] ]]; then
+        spec_todo=$((spec_todo + 1))
+      fi
+    done < "$PLAN"
+    if [[ -n "$current_spec" ]]; then
+      echo "  $current_spec: $spec_done done, $spec_todo remaining"
+    fi
+
+    echo ""
+    echo "--- COMPLETED TASKS ---"
+    grep '^\- \[x\] \*\*' "$PLAN" | sed 's/- \[x\] \*\*/  - /;s/\*\*//' || true
+
+    local in_progress_section=false
+    echo ""
+    echo "--- IN PROGRESS TASKS ---"
+    while IFS= read -r line; do
+      if [[ "$line" == "## In Progress" ]]; then
+        in_progress_section=true
+        continue
+      fi
+      if $in_progress_section; then
+        if [[ "$line" =~ ^## ]]; then
+          break
+        fi
+        if [[ "$line" == *"- [ ] "* ]]; then
+          echo "  $line" | sed 's/- \[ \] \*\*/  - /;s/\*\*//'
+        fi
+      fi
+    done < "$PLAN"
+
+    echo ""
+    echo "--- NEXT UP (first 3 backlog) ---"
+    grep '^\- \[ \] \*\*' "$PLAN" | head -3 | sed 's/- \[ \] \*\*/  - /;s/\*\*//' || true
+  else
+    echo "No IMPLEMENTATION_PLAN.md found"
+  fi
+
+  echo ""
+
+  # -- Specs --
+  progress "Reading specs..."
+  echo "--- SPECS ---"
+  if [[ -d "$ROOT/specs" ]]; then
+    local spec_count=0
+    for f in "$ROOT/specs"/*.md; do
+      [[ -e "$f" ]] || continue
+      spec_count=$((spec_count + 1))
+      echo "  $(basename "$f")"
+    done
+    echo "spec_files: $spec_count"
+    if [[ -d "$ROOT/specs/docs" ]]; then
+      local doc_count=0
+      for f in "$ROOT/specs/docs"/*.md; do
+        [[ -e "$f" ]] || continue
+        doc_count=$((doc_count + 1))
+        echo "  docs/$(basename "$f")"
+      done
+      echo "doc_files: $doc_count"
+    fi
+  else
+    echo "No specs/ directory found"
+  fi
+
+  echo ""
+
+  # -- Git History --
+  progress "Reading git history..."
+  echo "--- RECENT COMMITS ---"
+  git -C "$ROOT" log --format="  %h %ai %s" -20 2>/dev/null || echo "  No commits found"
+  echo ""
+
+  # -- Ralph Runtime Status --
+  progress "Checking runtime status..."
+  echo "--- RALPH RUNTIME STATUS ---"
+  local latest_log ralph_running=false
+  latest_log=$(ls -t "$LOGS_DIR"/*.log 2>/dev/null | head -1)
+
+  if docker compose -f "$ROOT/.ralph/docker-compose.yml" ps --status running ralph 2>/dev/null | grep -q ralph; then
+    ralph_running=true
+  fi
+  if ! $ralph_running && [[ -n "$latest_log" ]]; then
+    if find "$latest_log" -mmin -5 -print -quit 2>/dev/null | grep -q .; then
+      ralph_running=true
+    fi
+  fi
+
+  echo "ralph_running: $ralph_running"
+
+  if $ralph_running && [[ -n "$latest_log" ]]; then
+    echo "current_session: $(basename "$latest_log")"
+  fi
+  echo ""
+
+  # -- Build Sessions --
+  progress "Scanning build sessions..."
+  echo "--- BUILD SESSIONS ---"
+  if [[ -d "$LOGS_DIR" ]] && ls "$LOGS_DIR"/*.log &>/dev/null; then
+    local plan_count build_count
+    plan_count=$(ls "$LOGS_DIR"/*-plan*.log 2>/dev/null | wc -l | tr -d ' ')
+    build_count=$(ls "$LOGS_DIR"/*-build-*.log 2>/dev/null | wc -l | tr -d ' ')
+    echo "plan_sessions: $plan_count"
+    echo "build_sessions: $build_count"
+
+    local total_reverts=0 failed_sessions=0 reverts
+    for logfile in "$LOGS_DIR"/*.log; do
+      [[ -e "$logfile" ]] || continue
+      reverts=$(grep -cE 'git revert|git reset|reverting' "$logfile" 2>/dev/null || true)
+      reverts=${reverts:-0}
+      total_reverts=$((total_reverts + reverts))
+      if grep -q '"subtype":"error"' "$logfile" 2>/dev/null; then
+        failed_sessions=$((failed_sessions + 1))
+      fi
+    done
+    echo "total_reverts: $total_reverts"
+    echo "failed_sessions: $failed_sessions"
+  else
+    echo "No build logs found"
+  fi
+
+  echo ""
+
+  # -- Token Usage --
+  progress "Reading token usage..."
+  echo "--- TOKEN USAGE ---"
+  local token_csv="$LOGS_DIR/token-usage.csv"
+  if [[ -f "$token_csv" ]] && [[ $(wc -l < "$token_csv") -gt 1 ]]; then
+    local total_input=0 total_output=0 total_tokens=0 token_lines=0
+    while IFS=, read -r ts iter inp out tot; do
+      [[ "$ts" == "timestamp" ]] && continue
+      total_input=$((total_input + inp))
+      total_output=$((total_output + out))
+      total_tokens=$((total_tokens + tot))
+      token_lines=$((token_lines + 1))
+    done < "$token_csv"
+    echo "iterations_tracked: $token_lines"
+    echo "total_input_tokens: $total_input"
+    echo "total_output_tokens: $total_output"
+    echo "total_tokens: $total_tokens"
+    # Rough cost estimate (Opus: $15/M input, $75/M output)
+    local cost_cents=$(( (total_input * 15 + total_output * 75) / 10000 ))
+    local cost_dollars=$((cost_cents / 100))
+    local cost_remainder=$((cost_cents % 100))
+    printf "estimated_cost: \$%d.%02d\n" "$cost_dollars" "$cost_remainder"
+  else
+    echo "No token usage data yet"
+  fi
+
+  echo ""
+
+  # -- Git Status --
+  progress "Reading git status..."
+  echo "--- GIT STATUS ---"
+  local branch uncommitted
+  branch=$(git -C "$ROOT" branch --show-current 2>/dev/null || echo "unknown")
+  echo "branch: $branch"
+  uncommitted=$(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  echo "uncommitted_changes: $uncommitted"
+  if [[ $uncommitted -gt 0 ]]; then
+    echo "changed_files:"
+    git -C "$ROOT" status --porcelain 2>/dev/null | sed 's/^/  /'
+  fi
+
+  echo ""
+  echo "=== END REPORT ==="
+  progress_done
+}
+
+usage() {
+  echo "Usage: .ralph/ralph <init|plan|build|stop|status> [max_iterations]"
+  echo ""
+  echo "  .ralph/ralph init       Initialize project (create specs/, IMPLEMENTATION_PLAN.md)"
+  echo "  .ralph/ralph plan       Run Ralph in plan mode"
+  echo "  .ralph/ralph build      Run Ralph in build mode (runs until done)"
+  echo "  .ralph/ralph build 10   Run Ralph in build mode for 10 iterations"
+  echo "  .ralph/ralph stop       Stop Ralph after the current iteration"
+  echo "  .ralph/ralph status     Print a human-readable project status report"
+  exit 1
+}
+
+if [ $# -lt 1 ]; then
+  usage
+fi
+
+MODE="$1"
+RALPH_DIR="$ROOT/.ralph"
+
+if [ "$MODE" = "init" ]; then
+  echo "Initializing Ralph project structure..."
+
+  # Create specs directory
+  if [ ! -d "$ROOT/specs" ]; then
+    mkdir -p "$ROOT/specs"
+    echo "  Created specs/"
+  else
+    echo "  specs/ already exists"
+  fi
+
+  # Create specs/docs directory for architecture/vision docs
+  if [ ! -d "$ROOT/specs/docs" ]; then
+    mkdir -p "$ROOT/specs/docs"
+    echo "  Created specs/docs/"
+  else
+    echo "  specs/docs/ already exists"
+  fi
+
+  # Create IMPLEMENTATION_PLAN.md from template
+  if [ ! -f "$PLAN" ]; then
+    cp "$RALPH_DIR/templates/implementation_plan.md" "$PLAN"
+    echo "  Created IMPLEMENTATION_PLAN.md"
+  else
+    echo "  IMPLEMENTATION_PLAN.md already exists"
+  fi
+
+  # Create or update root CLAUDE.md with Ralph section
+  RALPH_SECTION='## Ralph
+
+This project uses Ralph for autonomous building. See `.ralph/CLAUDE.md` for the full workflow, spec-writing guide, and conventions.
+
+- Feature specs live in `specs/` -- one markdown file per feature
+- Architecture and vision docs live in `specs/docs/`
+- `IMPLEMENTATION_PLAN.md` tracks all tasks and verification commands
+- Run `.ralph/ralph` for commands (init, plan, build, stop, status)'
+
+  if [ ! -f "$ROOT/CLAUDE.md" ]; then
+    printf "# Project\n\n%s\n" "$RALPH_SECTION" > "$ROOT/CLAUDE.md"
+    echo "  Created CLAUDE.md"
+  elif ! grep -q '## Ralph' "$ROOT/CLAUDE.md"; then
+    printf "\n%s\n" "$RALPH_SECTION" >> "$ROOT/CLAUDE.md"
+    echo "  Added Ralph section to CLAUDE.md"
+  else
+    echo "  CLAUDE.md already has Ralph section"
+  fi
+
+  # Create logs directory
+  mkdir -p "$LOGS_DIR"
+  echo "  Created .ralph/logs/"
+
+  # Ensure .ralph/.env is gitignored (holds CLAUDE_CODE_OAUTH_TOKEN)
+  if [ ! -f "$ROOT/.gitignore" ]; then
+    echo ".ralph/.env" > "$ROOT/.gitignore"
+    echo "  Created .gitignore"
+  elif ! grep -qF '.ralph/.env' "$ROOT/.gitignore"; then
+    echo ".ralph/.env" >> "$ROOT/.gitignore"
+    echo "  Added .ralph/.env to .gitignore"
+  fi
+
+  echo ""
+  echo "Done. Next steps:"
+  echo "  1. Write specs in specs/ (see .ralph/CLAUDE.md for guidance)"
+  echo "  2. Run .ralph/ralph plan to generate the implementation plan"
+  echo "  3. Run .ralph/ralph build to start building"
+  exit 0
+fi
+
+if [ "$MODE" = "stop" ]; then
+  touch "$ROOT/.ralph/.stop"
+  echo "Stop file created. Ralph will stop after the current iteration."
+  exit 0
+fi
+
+STATUS_PROMPT="You are Ralph's status reporter. Synthesize this data into a project status report.
+
+Use this format:
+
+# Ralph Status
+
+**Status:** Running -- working on *<task>* | Idle
+**Progress:** N/N tasks (N%)
+
+## What's Been Built
+
+Summarize completed work grouped by feature area. Then list the last 3-5 recently completed tasks.
+
+## Remaining Work (N tasks across N specs)
+
+| Spec | Tasks Left |
+|------|-----------|
+| ... | ... |
+
+## Build History
+
+| Session | Started | Status |
+|---------|---------|--------|
+| ... | ... | ... |
+
+## Token Usage
+
+Total tokens, estimated cost, average per iteration.
+
+## Issues
+
+Reverts, failures, uncommitted changes. Or just \"No issues\" if clean.
+
+---
+Keep it concise. No filler. Use the exact section structure above. Only include sections where data exists."
+
+if [ "$MODE" = "status" ]; then
+  status_data=$(gather_status)
+
+  if [[ -n "${CLAUDECODE:-}" ]]; then
+    progress_done
+    echo "$status_data"
+    echo ""
+    echo "---"
+    echo "Synthesize the above data using this format:"
+    echo "$STATUS_PROMPT"
+    exit 0
+  fi
+
+  if ! command -v claude &>/dev/null; then
+    echo "Error: 'claude' CLI is not installed. Install it to use status mode."
+    exit 1
+  fi
+  PROGRESS_STEP=6
+  progress "Synthesizing report..."
+  response=$(echo "$status_data" | claude -p "$STATUS_PROMPT" --output-format text)
+  progress_done
+  echo "$response"
+  exit 0
+fi
+
+MAX_ITERATIONS="${2:-0}"
+
+if [ "$MODE" != "plan" ] && [ "$MODE" != "build" ]; then
+  echo "Error: mode must be 'init', 'plan', 'build', 'stop', or 'status'"
+  usage
+fi
+
+# Check devtun is configured (required for build mode)
+if [ "$MODE" = "build" ]; then
+  if ! command -v devtun &>/dev/null; then
+    echo "Error: devtun is not installed. Install it: npm install -g devtun"
+    exit 1
+  fi
+  if ! devtun config &>/dev/null; then
+    echo "Error: devtun is not configured. Run 'devtun setup' first."
+    exit 1
+  fi
+fi
+
+# Ensure CLAUDE_CODE_OAUTH_TOKEN is available (check env, then .ralph/.env)
+RALPH_ENV="$RALPH_DIR/.env"
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -f "$RALPH_ENV" ]; then
+  CLAUDE_CODE_OAUTH_TOKEN=$(grep '^CLAUDE_CODE_OAUTH_TOKEN=' "$RALPH_ENV" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  export CLAUDE_CODE_OAUTH_TOKEN
+fi
+
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  echo "CLAUDE_CODE_OAUTH_TOKEN is required for Ralph to authenticate with Claude."
+  echo ""
+  echo "You can either:"
+  echo "  1. Add it to $RALPH_ENV:  CLAUDE_CODE_OAUTH_TOKEN=your-token-here"
+  echo "  2. Export it:  export CLAUDE_CODE_OAUTH_TOKEN=your-token-here"
+  echo ""
+  read -rp "Paste your token now (or Ctrl-C to cancel): " CLAUDE_CODE_OAUTH_TOKEN
+  export CLAUDE_CODE_OAUTH_TOKEN
+
+  # Persist to .ralph/.env (upsert -- replace existing or append)
+  if [ -f "$RALPH_ENV" ] && grep -q '^CLAUDE_CODE_OAUTH_TOKEN=' "$RALPH_ENV"; then
+    sed -i.bak "s|^CLAUDE_CODE_OAUTH_TOKEN=.*|CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN|" "$RALPH_ENV" && rm -f "${RALPH_ENV}.bak"
+  elif [ -f "$RALPH_ENV" ]; then
+    echo "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN" >> "$RALPH_ENV"
+  else
+    echo "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN" > "$RALPH_ENV"
+  fi
+  echo "Token saved to $RALPH_ENV"
+fi
+
+# Ensure project-level files exist for plan/build
+if [ ! -d "$ROOT/specs" ]; then
+  echo "Error: specs/ directory not found. Run .ralph/ralph init first."
+  exit 1
+fi
+
+if [ ! -f "$PLAN" ]; then
+  cp "$RALPH_DIR/templates/implementation_plan.md" "$PLAN"
+  echo "Created IMPLEMENTATION_PLAN.md from template."
+fi
+
+mkdir -p "$LOGS_DIR"
+
+# Require a git repository
+if [ ! -d "$ROOT/.git" ]; then
+  echo "Error: No git repository found at project root."
+  echo "Initialize one first:  git init && git add -A && git commit -m 'initial commit'"
+  exit 1
+fi
+
+# Require git user identity (needed for commits inside the container)
+GIT_USER_NAME="$(git config user.name 2>/dev/null || true)"
+GIT_USER_EMAIL="$(git config user.email 2>/dev/null || true)"
+
+if [ -z "$GIT_USER_NAME" ]; then
+  echo "Error: git user.name is not configured."
+  echo "Set it first:  git config user.name \"Your Name\""
+  exit 1
+fi
+
+if [ -z "$GIT_USER_EMAIL" ]; then
+  echo "Error: git user.email is not configured."
+  echo "Set it first:  git config user.email \"you@example.com\""
+  exit 1
+fi
+
+# Clear any stale stop file from a previous run
+rm -f "$ROOT/.ralph/.stop"
+
+MAX_ITERATIONS_ARG=""
+if [ "$MAX_ITERATIONS" -gt 0 ]; then
+  MAX_ITERATIONS_ARG="-e RALPH_MAX_ITERATIONS=$MAX_ITERATIONS"
+fi
+
+# Deterministic scaffolding: runs host-side before the build loop.
+# Reads .ralph/.stack-manifest.yml (generated by the planner) and stamps out
+# Docker, env, and test files from templates. No LLM involved.
+scaffold_infra() {
+  if [ -f "$ROOT/.ralph/.scaffolded" ]; then
+    return
+  fi
+
+  if [ ! -f "$ROOT/.ralph/.stack-manifest.yml" ]; then
+    # No manifest yet -- planner hasn't run or project doesn't need scaffolding
+    return
+  fi
+
+  echo ""
+  echo "=== Running deterministic infrastructure scaffolding ==="
+  "$RALPH_DIR/scaffold-infra"
+
+  # Commit the scaffolded files
+  git -C "$ROOT" add -A
+  git -C "$ROOT" commit -m "scaffold: create infrastructure files"
+  echo "=== Scaffolding complete ==="
+  echo ""
+}
+
+# Activation: runs host-side tools (devtun, docker compose, nfi) that cannot
+# run inside the Ralph container.
+activate_scaffolding() {
+  if [ ! -f "$ROOT/.ralph/.scaffolded" ] || [ -f "$ROOT/.ralph/.activated" ]; then
+    return
+  fi
+
+  echo ""
+  echo "=== Activating infrastructure ==="
+
+  # Add devtun hostname (uses basename of project dir, dots to hyphens)
+  local hostname
+  hostname=$(basename "$ROOT" | tr '.' '-')
+  if command -v devtun &>/dev/null; then
+    echo "  Adding devtun hostname: $hostname..."
+    (cd "$ROOT" && devtun add "$hostname") || true
+
+    # Replace __DEVTUN_URL__ placeholders in stack .env files
+    local devtun_url="https://${hostname}.devtun.dev"
+    echo "  Setting app URL to $devtun_url in stack env files..."
+    find "$ROOT" -maxdepth 2 -name '.env' -not -path '*/.ralph/*' -not -path '*/node_modules/*' | while read -r envfile; do
+      if grep -q '__DEVTUN_URL__' "$envfile" 2>/dev/null; then
+        sed -i.bak "s|__DEVTUN_URL__|${devtun_url}|g" "$envfile" && rm -f "${envfile}.bak"
+      fi
+    done
+  fi
+
+  # Start only infrastructure services (db, redis, minio) -- NOT the app container.
+  # The app container needs package.json / go.mod / etc. which the first build task creates.
+  # The build agent starts the app container after scaffolding the application.
+  find "$ROOT" -maxdepth 2 -name 'docker-compose.yml' -not -path '*/.ralph/*' -not -path '*/node_modules/*' | while read -r composefile; do
+    local stackdir infra_services=""
+    stackdir=$(dirname "$composefile")
+    for svc in db redis minio; do
+      if grep -q "^  ${svc}:" "$composefile"; then
+        infra_services="$infra_services $svc"
+      fi
+    done
+    if [ -n "$infra_services" ]; then
+      echo "  Starting infrastructure services in $(basename "$stackdir"):$infra_services"
+      docker compose -f "$composefile" up -d --wait $infra_services
+    fi
+  done
+
+  # Run nfi if available to populate secrets in stack env files
+  if command -v nfi &>/dev/null; then
+    echo "  Running nfi to populate secrets..."
+    (cd "$ROOT" && nfi) || echo "  WARNING: nfi failed. Populate .env secrets manually."
+  else
+    echo "  NOTE: nfi not available. Populate secret values in stack .env files manually."
+  fi
+
+  touch "$ROOT/.ralph/.activated"
+  echo "=== Infrastructure activated ==="
+  echo ""
+
+  # Commit any files generated by activation (e.g., devtun config).
+  # Stack .env files should be in .gitignore, so only committed files get staged.
+  # Verify the tree is clean-ish before using add -A.
+  local dirty
+  dirty=$(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$dirty" -gt 0 ]; then
+    echo "  Committing activation artifacts..."
+    git -C "$ROOT" status --porcelain | sed 's/^/    /'
+    git -C "$ROOT" add -A
+    git -C "$ROOT" commit -m "chore: activate infrastructure"
+  fi
+}
+
+run_ralph() {
+  docker compose -f "$ROOT/.ralph/docker-compose.yml" --profile ralph run --rm --build \
+    -e RALPH_MODE="$MODE" \
+    -e GIT_AUTHOR_NAME="$GIT_USER_NAME" \
+    -e GIT_AUTHOR_EMAIL="$GIT_USER_EMAIL" \
+    -e GIT_COMMITTER_NAME="$GIT_USER_NAME" \
+    -e GIT_COMMITTER_EMAIL="$GIT_USER_EMAIL" \
+    $MAX_ITERATIONS_ARG \
+    ralph
+}
+
+# Build mode: scaffold and activate before launching the build loop.
+# Plan mode: just run the planner (it generates the manifest for next time).
+if [ "$MODE" = "build" ]; then
+  scaffold_infra
+  activate_scaffolding
+fi
+
+run_ralph

@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# This script runs inside the Ralph Docker container. Use ralph to launch it.
+if [ ! -f /.dockerenv ]; then
+    echo "Error: loop must run inside the Ralph container. Use .ralph/ralph instead."
+    exit 1
+fi
+
+LOCKDIR="/project/.ralph/.lock.d"
+STOPFILE="/project/.ralph/.stop"
+LOGDIR="/project/.ralph/logs"
+
+# Migrate old-style lockfile
+rm -f "/project/.ralph/.lock"
+
+# Prevent concurrent Ralph runs (mkdir is atomic on POSIX)
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  echo "Error: Ralph is already running (lockdir exists at $LOCKDIR)."
+  echo "If this is stale, remove it manually: rmdir $LOCKDIR"
+  exit 1
+fi
+trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
+
+MODE="${RALPH_MODE:-build}"
+MAX_ITERATIONS="${RALPH_MAX_ITERATIONS:-0}"
+MODEL="${RALPH_MODEL:-opus}"
+
+TOKEN_CSV="$LOGDIR/token-usage.csv"
+
+# Extract token usage from stream-json log and append to CSV
+track_tokens() {
+  local logfile="$1"
+  local iteration="$2"
+
+  # Initialize CSV if needed
+  if [ ! -f "$TOKEN_CSV" ]; then
+    echo "timestamp,iteration,input_tokens,output_tokens,total_tokens" > "$TOKEN_CSV"
+  fi
+
+  # Extract the last usage line from the stream-json log
+  local usage_line
+  usage_line=$(grep '"usage"' "$logfile" 2>/dev/null | tail -1 || true)
+  if [ -z "$usage_line" ]; then
+    return
+  fi
+
+  # Parse input_tokens and output_tokens (handles both nested and flat formats)
+  local input_tokens output_tokens
+  input_tokens=$(echo "$usage_line" | sed -n 's/.*"input_tokens"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+  output_tokens=$(echo "$usage_line" | sed -n 's/.*"output_tokens"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+  input_tokens=${input_tokens:-0}
+  output_tokens=${output_tokens:-0}
+  local total=$((input_tokens + output_tokens))
+
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ'),$iteration,$input_tokens,$output_tokens,$total" >> "$TOKEN_CSV"
+}
+
+# Check that the build agent only changed declared files and wrote tests
+post_commit_checks() {
+  local iteration="$1"
+
+  # Only run if there was a new commit
+  local latest_msg
+  latest_msg=$(git log -1 --format='%s' 2>/dev/null || true)
+  if [ -z "$latest_msg" ]; then
+    return
+  fi
+
+  # -- Diff validation: warn about undeclared file changes --
+  local changed_files
+  changed_files=$(git diff --name-only HEAD~1 2>/dev/null || true)
+  if [ -n "$changed_files" ]; then
+    local declared_file="/project/.ralph/.last-task-files"
+    local undeclared=""
+    while IFS= read -r file; do
+      [ -z "$file" ] && continue
+      # Skip allowlisted patterns
+      case "$file" in
+        *.lock|*lock.json|*/migrations/*|IMPLEMENTATION_PLAN.md|.ralph/logs/*|.ralph/.last-task-files|.ralph/.build-plan.md) continue ;;
+        *.test.*|*.spec.*|*_test.*|*_test_*) continue ;;
+      esac
+      # Check if file was declared
+      if [ -f "$declared_file" ] && grep -qF "$file" "$declared_file"; then
+        continue
+      fi
+      undeclared="$undeclared  $file"$'\n'
+    done <<< "$changed_files"
+
+    if [ -n "$undeclared" ]; then
+      echo "WARNING [iteration $iteration]: Files changed but not declared in task:"
+      echo "$undeclared"
+    fi
+  fi
+
+  # -- Test existence check --
+  local test_files
+  test_files=$(echo "$changed_files" | grep -cE '\.(test|spec)\.|_test\.' 2>/dev/null || true)
+  test_files=${test_files:-0}
+  if [ "$test_files" -eq 0 ]; then
+    # Check for new test functions in changed files
+    local test_funcs
+    test_funcs=$(git diff HEAD~1 -U0 2>/dev/null | grep -cE '^\+.*(it\(|test\(|describe\(|func Test|#\[test\])' || true)
+    test_funcs=${test_funcs:-0}
+    if [ "$test_funcs" -eq 0 ]; then
+      echo "WARNING [iteration $iteration]: No tests added or modified"
+    fi
+  fi
+}
+
+# Generate a context-optimized view of the plan for the build agent
+generate_slim_plan() {
+  local plan_file="$1"
+  local slim_file="/project/.ralph/.build-plan.md"
+
+  if [ ! -f "$plan_file" ]; then
+    return
+  fi
+
+  # Completed tasks: keep [x] title lines, strip indented sub-bullets (Files, Spec, Acceptance, Tests)
+  # All other sections: copy verbatim
+  awk '
+    /^## Completed/ { in_completed = 1; print; next }
+    /^## / { in_completed = 0; print; next }
+    in_completed {
+      if (/^- \[x\]/) { print; next }
+      if (/^[[:space:]]/) { next }
+      print; next
+    }
+    { print }
+  ' "$plan_file" > "$slim_file"
+
+  local size
+  size=$(wc -c < "$slim_file" | tr -d ' ')
+  if [ "$size" -gt 51200 ]; then
+    echo "WARNING: Build plan exceeds 50KB ($size bytes). Consider archiving old completed tasks."
+  fi
+}
+
+# Require authentication
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  echo "Error: CLAUDE_CODE_OAUTH_TOKEN is not set."
+  exit 1
+fi
+
+# Select prompt file
+if [ "$MODE" = "plan" ]; then
+  PROMPT_FILE="/project/.ralph/prompts/plan.md"
+elif [ "$MODE" = "build" ]; then
+  PROMPT_FILE="/project/.ralph/prompts/build.md"
+else
+  echo "Error: Unknown mode '$MODE'. Use 'plan' or 'build'."
+  exit 1
+fi
+
+if [ ! -f "$PROMPT_FILE" ]; then
+  echo "Error: Prompt file not found: $PROMPT_FILE"
+  exit 1
+fi
+
+PROMPT="$(cat "$PROMPT_FILE")"
+
+if [ "$MODE" = "plan" ]; then
+  echo "Starting Ralph in plan mode (single shot, model: $MODEL)..."
+else
+  if [ "$MAX_ITERATIONS" -eq 0 ]; then
+    echo "Starting Ralph in build mode (unlimited iterations, model: $MODEL)..."
+  else
+    echo "Starting Ralph in build mode for $MAX_ITERATIONS iteration(s) (model: $MODEL)..."
+  fi
+  echo "To stop after the current iteration: .ralph/ralph stop"
+fi
+
+cd /project
+
+mkdir -p "$LOGDIR"
+
+# Refuse to start if the working tree is dirty (catches user error)
+DIRTY=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+if [ "$DIRTY" -gt 0 ]; then
+  echo "Error: Working tree has uncommitted changes. Commit or discard them before running Ralph."
+  git status --short
+  exit 1
+fi
+
+PLAN="/project/IMPLEMENTATION_PLAN.md"
+
+# Plan mode is single-shot with completed-task preservation check
+if [ "$MODE" = "plan" ]; then
+  LOGFILE="$LOGDIR/$(date +%Y%m%d-%H%M%S)-plan.log"
+
+  # Snapshot completed tasks before planning
+  COMPLETED_BEFORE=0
+  if [ -f "$PLAN" ]; then
+    COMPLETED_BEFORE=$(grep -c '^\- \[x\]' "$PLAN" 2>/dev/null || true)
+    COMPLETED_BEFORE=${COMPLETED_BEFORE:-0}
+    cp "$PLAN" "$PLAN.bak"
+  fi
+
+  echo ""
+  echo "Log: $LOGFILE"
+  echo ""
+
+  PLAN_EXIT=0
+  timeout 1800 claude -p "$PROMPT" \
+    --dangerously-skip-permissions \
+    --output-format=stream-json \
+    --model "$MODEL" \
+    --verbose < /dev/null > "$LOGFILE" 2>&1 || PLAN_EXIT=$?
+
+  if [ "$PLAN_EXIT" -eq 124 ]; then
+    echo "Error: Planning timed out after 30 minutes."
+  elif [ "$PLAN_EXIT" -ne 0 ]; then
+    echo "Warning: Claude exited with code $PLAN_EXIT (see log for details)"
+  fi
+
+  track_tokens "$LOGFILE" "plan"
+
+  # Verify completed tasks were preserved
+  if [ -f "$PLAN" ] && [ "$COMPLETED_BEFORE" -gt 0 ]; then
+    COMPLETED_AFTER=$(grep -c '^\- \[x\]' "$PLAN" 2>/dev/null || true)
+    COMPLETED_AFTER=${COMPLETED_AFTER:-0}
+    if [ "$COMPLETED_AFTER" -lt "$COMPLETED_BEFORE" ]; then
+      echo ""
+      echo "WARNING: Planner dropped completed tasks ($COMPLETED_BEFORE -> $COMPLETED_AFTER)."
+      echo "Restoring from backup. Review the plan log for details."
+      cp "$PLAN.bak" "$PLAN"
+      git checkout -- "$PLAN" 2>/dev/null || cp "$PLAN.bak" "$PLAN"
+    fi
+    rm -f "$PLAN.bak"
+  fi
+
+  # Clean up any .bak files the LLM may have created (git is version control, not .bak files)
+  find /project -maxdepth 3 -name '*.bak' -not -path '*/.ralph/logs/*' -delete 2>/dev/null || true
+else
+  # Build mode loop
+  i=0
+  while true; do
+    if [ -f "$STOPFILE" ]; then
+      echo "Stop file detected. Exiting."
+      break
+    fi
+
+    i=$((i + 1))
+
+    if [ "$MAX_ITERATIONS" -gt 0 ] && [ "$i" -gt "$MAX_ITERATIONS" ]; then
+      break
+    fi
+
+    LOGFILE="$LOGDIR/$(date +%Y%m%d-%H%M%S)-build-${i}.log"
+
+    # Warn about data that will be discarded
+    UNTRACKED=$(git ls-files --others --exclude-standard 2>/dev/null | grep -v '^\\.ralph/' || true)
+    if [ -n "$UNTRACKED" ]; then
+      echo "WARNING [iteration $i]: Discarding untracked files:"
+      echo "$UNTRACKED" | sed 's/^/  /'
+    fi
+    DIRTY_FILES=$(git diff --name-only 2>/dev/null || true)
+    if [ -n "$DIRTY_FILES" ]; then
+      echo "WARNING [iteration $i]: Discarding uncommitted changes in:"
+      echo "$DIRTY_FILES" | sed 's/^/  /'
+    fi
+
+    # Clean up any leftover changes from a crashed previous iteration
+    git checkout -- . 2>/dev/null || true
+    git clean -fd 2>/dev/null || true
+
+    # Generate context-optimized plan for the build agent
+    generate_slim_plan "$PLAN"
+
+    echo ""
+    if [ "$MAX_ITERATIONS" -eq 0 ]; then
+      echo "=== Iteration $i ==="
+    else
+      echo "=== Iteration $i / $MAX_ITERATIONS ==="
+    fi
+    echo "Log: $LOGFILE"
+    echo ""
+
+    export RALPH_ITERATION="$i"
+
+    EXIT_CODE=0
+    timeout 1800 claude -p "Current iteration: $i"$'\n\n'"$PROMPT" \
+      --dangerously-skip-permissions \
+      --output-format=stream-json \
+      --model "$MODEL" \
+      --verbose < /dev/null > "$LOGFILE" 2>&1 || EXIT_CODE=$?
+
+    if [ "$EXIT_CODE" -eq 124 ]; then
+      echo "Error: Build iteration timed out after 30 minutes."
+    elif [ "$EXIT_CODE" -ne 0 ]; then
+      echo "Warning: Claude exited with code $EXIT_CODE (see log for details)"
+    fi
+
+    track_tokens "$LOGFILE" "$i"
+    post_commit_checks "$i"
+
+    echo "=== Iteration $i complete ==="
+
+    # Brief pause before next iteration
+    if [ "$MAX_ITERATIONS" -eq 0 ] || [ "$i" -lt "$MAX_ITERATIONS" ]; then
+      echo ""
+      echo "Next iteration in 5s -- run .ralph/ralph stop to stop after this cycle"
+      for s in 5 4 3 2 1; do
+        if [ -f "$STOPFILE" ]; then
+          echo "Stop file detected. Exiting."
+          break 2
+        fi
+        printf "\r  %d..." "$s"
+        sleep 1
+      done
+      printf "\r       \r"
+    fi
+  done
+fi
+
+echo ""
+echo "Ralph finished in $MODE mode."

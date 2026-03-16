@@ -1,0 +1,20 @@
+services:
+  ralph:
+    build:
+      context: ..
+      dockerfile: .ralph/Dockerfile.ralph
+    profiles:
+      - ralph
+    env_file:
+      - .env
+    environment:
+      RALPH_MODE: ${RALPH_MODE:-build}
+      RALPH_MAX_ITERATIONS: ${RALPH_MAX_ITERATIONS:-0}
+      RALPH_MODEL: ${RALPH_MODEL:-opus}
+      GIT_AUTHOR_NAME: ${GIT_AUTHOR_NAME:-}
+      GIT_AUTHOR_EMAIL: ${GIT_AUTHOR_EMAIL:-}
+      GIT_COMMITTER_NAME: ${GIT_COMMITTER_NAME:-}
+      GIT_COMMITTER_EMAIL: ${GIT_COMMITTER_EMAIL:-}
+    volumes:
+      - ..:/project
+      - /var/run/docker.sock:/var/run/docker.sock

@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Deterministic infrastructure scaffolding.
+# Reads .ralph/.stack-manifest.yml and stamps out Docker, env, and test files
+# from templates. No LLM involved -- this runs on the host before the build loop.
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RALPH_DIR="$ROOT/.ralph"
+MANIFEST="$RALPH_DIR/.stack-manifest.yml"
+TEMPLATES="$RALPH_DIR/templates/docker"
+ENV_VARS_NEEDED="$RALPH_DIR/.env-vars-needed"
+
+if [ -f "$RALPH_DIR/.scaffolded" ]; then
+  echo "Infrastructure already scaffolded. Remove .ralph/.scaffolded to re-run."
+  exit 0
+fi
+
+if [ ! -f "$MANIFEST" ]; then
+  echo "Error: Stack manifest not found at $MANIFEST"
+  echo "Run .ralph/ralph plan first to generate it."
+  exit 1
+fi
+
+# Parse project name from manifest
+PROJECT_NAME=$(grep '^project_name:' "$MANIFEST" | sed 's/^project_name:[[:space:]]*//' | tr -d "\"'")
+if [ -z "$PROJECT_NAME" ]; then
+  PROJECT_NAME=$(basename "$ROOT" | tr '[:upper:]' '[:lower:]' | tr ' .' '-')
+fi
+
+echo "Scaffolding infrastructure for project: $PROJECT_NAME"
+
+# Parse stacks from manifest into pipe-delimited lines: name|dir|lang|service1,service2
+# Expected YAML format:
+#   stacks:
+#     - name: app
+#       dir: app
+#       lang: node
+#       services:
+#         - postgres
+#         - redis
+parse_manifest() {
+  awk '
+    /^stacks:/ { in_stacks=1; next }
+    !in_stacks { next }
+    /^[^ ]/ && !/^stacks:/ { exit }
+
+    /^  - name:/ {
+      if (name != "") print name "|" dir "|" lang "|" services
+      name = $NF; dir = ""; lang = ""; services = ""; in_svc = 0
+      next
+    }
+    /^    dir:/ { dir = $NF; next }
+    /^    lang:/ { lang = $NF; next }
+    /^    services:/ { in_svc = 1; next }
+    in_svc && /^      - / { svc = $NF; services = (services == "" ? svc : services "," svc); next }
+    in_svc && !/^      -/ && !/^[[:space:]]*$/ { in_svc = 0 }
+
+    END { if (name != "") print name "|" dir "|" lang "|" services }
+  ' "$MANIFEST"
+}
+
+# Look up a variable name in env-vars.yml and return its default (or empty)
+lookup_var_default() {
+  local var_name="$1"
+  local kb="$RALPH_DIR/knowledge/env-vars.yml"
+  [ -f "$kb" ] || return 0
+
+  awk -v var="$var_name" '
+    /- name:/ && $NF == var { found=1; next }
+    found && /default:/ {
+      val = $0
+      sub(/.*default:[[:space:]]*/, "", val)
+      gsub(/^"|"$/, "", val)
+      print val
+      exit
+    }
+    found && /- name:/ { exit }
+    found && /^[^ ]/ { exit }
+  ' "$kb"
+}
+
+# Generate Dockerfile for a stack
+generate_dockerfile() {
+  local stack_dir="$1" lang="$2"
+  local template="$TEMPLATES/${lang}.Dockerfile"
+
+  if [ ! -f "$template" ]; then
+    echo "  WARNING: No Dockerfile template for lang '$lang'. Skipping."
+    return
+  fi
+
+  cp "$template" "$stack_dir/Dockerfile"
+  echo "  Created $stack_dir/Dockerfile"
+}
+
+# Generate docker-compose.yml for a stack
+generate_compose() {
+  local stack_dir="$1" name="$2" lang="$3" services="$4"
+
+  local compose_file="$stack_dir/docker-compose.yml"
+  local volumes=""
+
+  # Determine app service name and image settings
+  local app_svc="$name"
+  local workdir="/app"
+
+  {
+    echo "services:"
+    echo "  $app_svc:"
+    echo "    build: ."
+    echo "    volumes:"
+    echo "      - .:$workdir"
+
+    # Language-specific volume for dependencies
+    case "$lang" in
+      node)
+        echo "      - node_modules:${workdir}/node_modules"
+        volumes="node_modules"
+        ;;
+    esac
+
+    echo "    env_file: .env"
+
+    # Add depends_on for services
+    if [ -n "$services" ]; then
+      echo "    depends_on:"
+      IFS=',' read -ra svc_array <<< "$services"
+      for svc in "${svc_array[@]}"; do
+        case "$svc" in
+          postgres) echo "      db:" ; echo "        condition: service_healthy" ;;
+          redis)    echo "      redis:" ; echo "        condition: service_healthy" ;;
+          minio)    echo "      minio:" ; echo "        condition: service_healthy" ;;
+        esac
+      done
+    fi
+
+    echo ""
+
+    # Add service definitions from partials
+    IFS=',' read -ra svc_array <<< "$services"
+    for svc in "${svc_array[@]}"; do
+      local partial="$TEMPLATES/compose.partial.${svc}.yml"
+      if [ -f "$partial" ]; then
+        # Substitute PROJECT_NAME and strip volume-section comments from partial
+        sed -e "s/\${PROJECT_NAME}/$PROJECT_NAME/g" -e '/^# Add to volumes section:/d' -e '/^#   [a-z]/d' "$partial"
+        echo ""
+
+        # Track volumes needed
+        case "$svc" in
+          postgres) volumes="${volumes:+$volumes,}pgdata" ;;
+          minio)    volumes="${volumes:+$volumes,}miniodata" ;;
+          redis)    volumes="${volumes:+$volumes,}redisdata" ;;
+        esac
+      fi
+    done
+
+    # Write volumes section
+    if [ -n "$volumes" ]; then
+      echo "volumes:"
+      IFS=',' read -ra vol_array <<< "$volumes"
+      for vol in "${vol_array[@]}"; do
+        echo "  $vol:"
+      done
+    fi
+  } > "$compose_file"
+
+  echo "  Created $compose_file"
+}
+
+# Generate .env and .env.example for a stack
+generate_env() {
+  local stack_dir="$1" lang="$2" services="$3"
+
+  local env_file="$stack_dir/.env"
+  local example_file="$stack_dir/.env.example"
+
+  > "$env_file"
+  > "$example_file"
+
+  # Track vars already written to avoid duplicates
+  local written_vars=""
+  write_var() {
+    local var_name="$1" default_val="$2" is_secret="${3:-false}"
+    # Skip if already written
+    if echo "$written_vars" | grep -qF "|${var_name}|"; then
+      return
+    fi
+    written_vars="${written_vars}|${var_name}|"
+
+    if [ -n "$default_val" ]; then
+      echo "${var_name}=${default_val}" >> "$env_file"
+      echo "${var_name}=${default_val}" >> "$example_file"
+    elif $is_secret; then
+      echo "${var_name}=" >> "$env_file"
+      local placeholder
+      placeholder=$(echo "$var_name" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+      echo "${var_name}=your-${placeholder}-here" >> "$example_file"
+    else
+      echo "${var_name}=" >> "$env_file"
+      echo "${var_name}=" >> "$example_file"
+    fi
+  }
+  write_section() {
+    echo "" >> "$env_file"
+    echo "# $1" >> "$env_file"
+    echo "" >> "$example_file"
+    echo "# $1" >> "$example_file"
+  }
+
+  # Service-derived vars
+  IFS=',' read -ra svc_array <<< "$services"
+  for svc in "${svc_array[@]}"; do
+    case "$svc" in
+      postgres)
+        write_section "Database"
+        write_var "DATABASE_URL" "postgresql://postgres:postgres@db:5432/${PROJECT_NAME}?schema=public"
+        write_var "DATABASE_URL_TEST" "postgresql://postgres:postgres@db:5432/${PROJECT_NAME}_test?schema=public"
+        ;;
+      redis)
+        write_section "Redis"
+        write_var "REDIS_URL" "redis://redis:6379"
+        ;;
+      minio)
+        write_section "Object Storage (MinIO)"
+        write_var "S3_ENDPOINT" "http://minio:9000"
+        write_var "S3_ACCESS_KEY" "minioadmin"
+        write_var "S3_SECRET_KEY" "minioadmin"
+        write_var "S3_BUCKET" "${PROJECT_NAME}-uploads"
+        write_var "S3_REGION" "us-east-1"
+        ;;
+    esac
+  done
+
+  # Vars from .env-vars-needed
+  if [ -f "$ENV_VARS_NEEDED" ]; then
+    local current_section=""
+    while IFS= read -r line; do
+      # Skip empty lines
+      [[ -z "$line" ]] && continue
+      # Section header
+      if [[ "$line" =~ ^#\ (.+) ]]; then
+        current_section="${BASH_REMATCH[1]}"
+        write_section "$current_section"
+        continue
+      fi
+      # Skip inline comments
+      [[ "$line" =~ ^# ]] && continue
+
+      local var_name
+      var_name=$(echo "$line" | sed 's/[[:space:]]*#.*//' | tr -d ' ')
+      [ -z "$var_name" ] && continue
+
+      # Look up default
+      local default_val
+      default_val=$(lookup_var_default "$var_name")
+
+      # Substitute PROJECT_NAME in defaults
+      default_val="${default_val//\$\{PROJECT_NAME\}/$PROJECT_NAME}"
+
+      # Determine if this is a secret (no default, name contains KEY, SECRET, TOKEN, PASSWORD)
+      local is_secret=false
+      if [ -z "$default_val" ]; then
+        if echo "$var_name" | grep -qE '(KEY|SECRET|TOKEN|PASSWORD|DSN)'; then
+          is_secret=true
+        fi
+      fi
+
+      write_var "$var_name" "$default_val" "$is_secret"
+    done < "$ENV_VARS_NEEDED"
+  fi
+
+  echo "  Created $env_file and $example_file"
+}
+
+# Generate test.sh at project root
+generate_test_script() {
+  local test_script="$ROOT/test.sh"
+
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo ''
+    echo '# Run all project tests. Each stack runs tests inside its own container.'
+
+    while IFS='|' read -r name dir lang services; do
+      echo ''
+      echo "# $name ($lang)"
+      case "$lang" in
+        node)
+          echo "docker compose -f $dir/docker-compose.yml exec $name sh -c 'DATABASE_URL=\"\$DATABASE_URL_TEST\" npm test -- \"\$@\"' -- \"\$@\""
+          ;;
+        go)
+          echo "docker compose -f $dir/docker-compose.yml exec $name sh -c 'DATABASE_URL=\"\$DATABASE_URL_TEST\" go test ./...'"
+          ;;
+        python)
+          echo "docker compose -f $dir/docker-compose.yml exec $name sh -c 'DATABASE_URL=\"\$DATABASE_URL_TEST\" python -m pytest \"\$@\"' -- \"\$@\""
+          ;;
+      esac
+    done < <(parse_manifest)
+  } > "$test_script"
+  chmod +x "$test_script"
+  echo "  Created test.sh"
+}
+
+# Update .gitignore
+update_gitignore() {
+  local gitignore="$ROOT/.gitignore"
+
+  while IFS='|' read -r name dir lang services; do
+    local env_pattern="$dir/.env"
+    if [ ! -f "$gitignore" ]; then
+      echo "$env_pattern" > "$gitignore"
+    elif ! grep -qF "$env_pattern" "$gitignore"; then
+      echo "$env_pattern" >> "$gitignore"
+    fi
+  done < <(parse_manifest)
+
+  echo "  Updated .gitignore"
+}
+
+# Main
+echo ""
+
+while IFS='|' read -r name dir lang services; do
+  echo "Stack: $name (dir=$dir, lang=$lang, services=$services)"
+
+  mkdir -p "$ROOT/$dir"
+  generate_dockerfile "$ROOT/$dir" "$lang"
+  generate_compose "$ROOT/$dir" "$name" "$lang" "$services"
+  generate_env "$ROOT/$dir" "$lang" "$services"
+
+  # Copy init-test-db.sh if postgres is a service
+  if [[ ",$services," == *",postgres,"* ]]; then
+    cp "$TEMPLATES/init-test-db.sh" "$ROOT/$dir/init-test-db.sh"
+    chmod +x "$ROOT/$dir/init-test-db.sh"
+    echo "  Created $dir/init-test-db.sh"
+  fi
+
+  echo ""
+done < <(parse_manifest)
+
+generate_test_script
+update_gitignore
+
+touch "$RALPH_DIR/.scaffolded"
+echo ""
+echo "Infrastructure scaffolding complete."
