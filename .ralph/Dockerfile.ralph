@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     ca-certificates \
+    gosu \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
     && chmod a+r /etc/apt/keyrings/docker.asc \
@@ -16,8 +17,11 @@ RUN apt-get update && apt-get install -y \
 RUN npm install -g @anthropic-ai/claude-code
 
 RUN useradd -m -s /bin/bash ralph
-USER ralph
 
 WORKDIR /project
 
+COPY .ralph/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["bash", "/project/.ralph/loop"]

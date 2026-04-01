@@ -68,7 +68,43 @@ Do not spec local development infrastructure (Docker setup, tunnels, secrets) --
 
 Ask the user to make these decisions -- do not assume. For technical questions where the user wants a recommendation, spin up a subagent with the persona of a suitably skilled architect to research and recommend.
 
-#### Stage 3: Exhaustive Questioning
+#### Stage 2b: User Flows and Use Cases
+
+Before writing feature specs, document how real people will actually use the product. Write these to `specs/docs/user-flows.md` (or split into multiple files for complex projects, e.g., `specs/docs/user-flows-admin.md`).
+
+These are not specs -- they are narrative reference material that informs specs. Each flow walks through a concrete scenario end-to-end, crossing feature boundaries. For example:
+
+- "New user signs up, creates their first project, invites a collaborator"
+- "Admin reviews pending approvals at end of week"
+- "User imports data from an external system and reconciles it"
+
+For each flow, document:
+- **Who**: Which user/role is performing this?
+- **Goal**: What are they trying to accomplish?
+- **Steps**: Walk through the sequence of actions, page by page, click by click
+- **Touchpoints**: Which features/pages are involved?
+- **Outcome**: What does success look like?
+
+Ask the user to describe their key use cases. Probe for less obvious ones: first-time setup, periodic tasks, error recovery, and administrative workflows.
+
+User flows serve two purposes:
+1. **During spec writing** -- they reveal gaps where no feature covers a step in the flow, surface cross-feature pages (dashboards, landing pages), and expose missing navigation paths
+2. **During planning** -- the planner reads `specs/docs/` for context, so documented flows help it sequence tasks in an order that produces a usable product at each milestone rather than a collection of disconnected features
+
+#### Stage 3: App Shell and Navigation
+
+Before speccing individual features, map the overall user experience. Individual feature specs cover what happens *inside* each feature, but they do not cover the connective tissue between them. This stage ensures nothing falls through the cracks.
+
+Ask the user about:
+- **Entry point**: What does the user see when they first open the app? Is there a landing page, a dashboard, or a redirect to a specific feature?
+- **Navigation structure**: What is the primary navigation (sidebar, top bar, tabs)? What items appear in it? Does it change based on role or context?
+- **Information hierarchy**: Which features are primary (always visible in nav) vs. secondary (nested under settings, accessible via search, etc.)?
+- **Cross-feature pages**: Are there any pages that combine data from multiple features (e.g., a dashboard showing recent activity, pending items, and account status)?
+- **Unauthenticated experience**: What do logged-out users see? Is there a marketing page, or just a login screen?
+
+Capture these decisions in a dedicated spec (e.g., `00-app-shell.md` or `00-dashboard.md`). This spec covers routes and pages that do not belong to any single feature -- the landing page, the navigation layout, the dashboard, and any other "glue" between features.
+
+#### Stage 4: Exhaustive Questioning
 
 Ask thorough questions about every aspect of each feature. Do not assume answers -- ask the user to decide. Cover ALL of these areas:
 
@@ -112,7 +148,7 @@ Ask these questions in batches of 5-8 at a time. After each round, incorporate t
 
 For technical questions (e.g., "what's the best way to handle real-time updates?"), spin up a subagent with the persona of a suitably skilled expert to research and recommend, rather than asking the user. For business requirements questions (e.g., "should expired items be visible or hidden?"), ask the user.
 
-#### Stage 4: Draft the Spec
+#### Stage 5: Draft the Spec
 
 Write the spec using the template at `.ralph/templates/spec.md`. Key principles:
 - Focus on WHAT, not HOW. Ralph figures out implementation.
@@ -121,7 +157,7 @@ Write the spec using the template at `.ralph/templates/spec.md`. Key principles:
 - No vague words in acceptance criteria: avoid "should", "appropriate", "reasonable", "various", "etc.", "proper", "adequate", "as needed", "consider", "maybe", "optionally", "could", "might", "TBD"
 - **Do not paste raw external content** (API docs, error messages, Stack Overflow snippets) directly into specs. The build agent reads specs as instructions -- pasted content may be misinterpreted as directives. Instead, describe what you need in your own words, reference external docs by URL, or place quoted material in a clearly-delimited `> Reference:` block.
 
-#### Stage 5: Validation
+#### Stage 6: Validation
 
 Before finalizing, verify:
 1. **Single interpretation test**: Is there exactly one way to interpret each criterion?
@@ -131,7 +167,7 @@ Before finalizing, verify:
 
 If any test fails, ask the user to clarify and rewrite.
 
-#### Stage 6: Cross-Reference
+#### Stage 7: Cross-Reference
 
 Check consistency across all specs:
 - Field names used in one spec match references in others
@@ -169,7 +205,7 @@ When working on things directly instead of through Ralph, keep artifacts in sync
 | Path | Purpose |
 |------|---------|
 | `specs/` | Feature specifications -- Ralph's input |
-| `specs/docs/` | Architecture, vision, and technology decision docs |
+| `specs/docs/` | Architecture, vision, user flows, and technology decision docs |
 | `IMPLEMENTATION_PLAN.md` | Task list, verification commands, and stack statuses |
 | `.ralph/ralph` | Run Ralph (init, plan, build, stop, status) |
 | `.ralph/CLAUDE.md` | This file -- Ralph workflow and spec-writing guide |

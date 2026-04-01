@@ -114,7 +114,7 @@ stacks:
 Fields:
 - `project_name`: used for database names, S3 buckets, devtun hostname
 - `name`: the docker-compose service name for the app container
-- `dir`: directory relative to project root
+- `dir`: directory relative to project root. For new projects, always use a subdirectory (e.g., `web`, `api`), never `.` -- keeps the root clean and avoids reorganization if a second stack is added later. If a manifest already exists, do not change `dir` values.
 - `lang`: one of `node`, `go`, `python` (determines Dockerfile template)
 - `services`: infrastructure services needed (postgres, redis, minio)
 

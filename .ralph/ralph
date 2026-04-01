@@ -228,15 +228,171 @@ gather_status() {
   progress_done
 }
 
-usage() {
-  echo "Usage: .ralph/ralph <init|plan|build|stop|status> [max_iterations]"
+format_quick_status() {
+  echo "Ralph Quick Status"
+  echo "=================="
+
+  # -- Running/Idle --
+  local ralph_running=false latest_log
+  latest_log=$(ls -t "$LOGS_DIR"/*.log 2>/dev/null | head -1)
+
+  if docker compose -f "$ROOT/.ralph/docker-compose.yml" ps --status running ralph 2>/dev/null | grep -q ralph; then
+    ralph_running=true
+  fi
+  if ! $ralph_running && [[ -n "${latest_log:-}" ]]; then
+    if find "$latest_log" -mmin -5 -print -quit 2>/dev/null | grep -q .; then
+      ralph_running=true
+    fi
+  fi
+
+  if $ralph_running; then
+    printf "Status:    Running (session: %s)\n" "$(basename "${latest_log:-unknown}")"
+  else
+    echo "Status:    Idle"
+  fi
+
+  # -- Progress --
+  if [[ -f "$PLAN" ]]; then
+    local completed backlog total pct
+    completed=$(grep -c '^\- \[x\]' "$PLAN" 2>/dev/null || true)
+    completed=${completed:-0}
+    backlog=$(grep -c '^\- \[ \]' "$PLAN" 2>/dev/null || true)
+    backlog=${backlog:-0}
+    total=$((completed + backlog))
+    if [[ $total -gt 0 ]]; then
+      pct=$((completed * 100 / total))
+    else
+      pct=0
+    fi
+    printf "Progress:  %d/%d tasks (%d%%)\n" "$completed" "$total" "$pct"
+  else
+    echo "Progress:  No IMPLEMENTATION_PLAN.md found"
+  fi
+
+  # -- Git --
+  local branch uncommitted
+  branch=$(git -C "$ROOT" branch --show-current 2>/dev/null || echo "unknown")
+  uncommitted=$(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  if [[ $uncommitted -gt 0 ]]; then
+    printf "Branch:    %s (%d uncommitted changes)\n" "$branch" "$uncommitted"
+  else
+    printf "Branch:    %s (clean)\n" "$branch"
+  fi
+
   echo ""
-  echo "  .ralph/ralph init       Initialize project (create specs/, IMPLEMENTATION_PLAN.md)"
-  echo "  .ralph/ralph plan       Run Ralph in plan mode"
-  echo "  .ralph/ralph build      Run Ralph in build mode (runs until done)"
-  echo "  .ralph/ralph build 10   Run Ralph in build mode for 10 iterations"
-  echo "  .ralph/ralph stop       Stop Ralph after the current iteration"
-  echo "  .ralph/ralph status     Print a human-readable project status report"
+
+  # -- Tasks by spec --
+  if [[ -f "$PLAN" ]]; then
+    echo "Tasks by spec:"
+    local current_spec="" spec_done=0 spec_todo=0 spec_total=0 max_name_len=0
+    local -a spec_names=() spec_dones=() spec_todos=()
+
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^###\ (.+) ]]; then
+        if [[ -n "$current_spec" ]]; then
+          spec_names+=("$current_spec")
+          spec_dones+=("$spec_done")
+          spec_todos+=("$spec_todo")
+          local name_len=${#current_spec}
+          if [[ $name_len -gt $max_name_len ]]; then
+            max_name_len=$name_len
+          fi
+        fi
+        current_spec="${BASH_REMATCH[1]}"
+        spec_done=0
+        spec_todo=0
+      elif [[ "$line" =~ ^\-\ \[x\] ]]; then
+        spec_done=$((spec_done + 1))
+      elif [[ "$line" =~ ^\-\ \[\ \] ]]; then
+        spec_todo=$((spec_todo + 1))
+      fi
+    done < "$PLAN"
+    if [[ -n "$current_spec" ]]; then
+      spec_names+=("$current_spec")
+      spec_dones+=("$spec_done")
+      spec_todos+=("$spec_todo")
+      local name_len=${#current_spec}
+      if [[ $name_len -gt $max_name_len ]]; then
+        max_name_len=$name_len
+      fi
+    fi
+
+    for ((i=0; i<${#spec_names[@]}; i++)); do
+      local name="${spec_names[$i]}"
+      local done_count="${spec_dones[$i]}"
+      local todo_count="${spec_todos[$i]}"
+      spec_total=$((done_count + todo_count))
+      if [[ $todo_count -eq 0 ]]; then
+        printf "  %-${max_name_len}s  %d/%d done\n" "$name" "$done_count" "$spec_total"
+      else
+        printf "  %-${max_name_len}s  %d/%d done (%d remaining)\n" "$name" "$done_count" "$spec_total" "$todo_count"
+      fi
+    done
+  fi
+
+  echo ""
+
+  # -- Build history --
+  echo "Build history:"
+  if [[ -d "$LOGS_DIR" ]] && ls "$LOGS_DIR"/*.log &>/dev/null; then
+    local plan_count build_count
+    plan_count=$(ls "$LOGS_DIR"/*-plan*.log 2>/dev/null | wc -l | tr -d ' ')
+    build_count=$(ls "$LOGS_DIR"/*-build-*.log 2>/dev/null | wc -l | tr -d ' ')
+
+    local total_reverts=0 failed_sessions=0 reverts
+    for logfile in "$LOGS_DIR"/*.log; do
+      [[ -e "$logfile" ]] || continue
+      reverts=$(grep -cE 'git revert|git reset|reverting' "$logfile" 2>/dev/null || true)
+      reverts=${reverts:-0}
+      total_reverts=$((total_reverts + reverts))
+      if grep -q '"subtype":"error"' "$logfile" 2>/dev/null; then
+        failed_sessions=$((failed_sessions + 1))
+      fi
+    done
+
+    printf "  Plan sessions: %d  |  Build iterations: %d\n" "$plan_count" "$build_count"
+    printf "  Reverts: %d  |  Failed sessions: %d\n" "$total_reverts" "$failed_sessions"
+  else
+    echo "  No build logs found"
+  fi
+
+  echo ""
+
+  # -- Token usage --
+  echo "Token usage:"
+  local token_csv="$LOGS_DIR/token-usage.csv"
+  if [[ -f "$token_csv" ]] && [[ $(wc -l < "$token_csv") -gt 1 ]]; then
+    local total_input=0 total_output=0 total_tokens=0 token_lines=0
+    while IFS=, read -r ts iter inp out tot; do
+      [[ "$ts" == "timestamp" ]] && continue
+      total_input=$((total_input + inp))
+      total_output=$((total_output + out))
+      total_tokens=$((total_tokens + tot))
+      token_lines=$((token_lines + 1))
+    done < "$token_csv"
+
+    local cost_cents=$(( (total_input * 15 + total_output * 75) / 10000 ))
+    local cost_dollars=$((cost_cents / 100))
+    local cost_remainder=$((cost_cents % 100))
+
+    printf "  Iterations tracked: %d\n" "$token_lines"
+    printf "  Total tokens: %'d  (~\$%d.%02d)\n" "$total_tokens" "$cost_dollars" "$cost_remainder"
+  else
+    echo "  No token usage data yet"
+  fi
+}
+
+usage() {
+  echo "Usage: .ralph/ralph <init|plan|build|stop|status|quick-status> [max_iterations]"
+  echo ""
+  echo "  .ralph/ralph init            Initialize project (create specs/, IMPLEMENTATION_PLAN.md)"
+  echo "  .ralph/ralph plan            Run Ralph in plan mode"
+  echo "  .ralph/ralph build           Run Ralph in build mode (runs until done)"
+  echo "  .ralph/ralph build 10        Run Ralph in build mode for 10 iterations"
+  echo "  .ralph/ralph build --recover Discard uncommitted changes and start building"
+  echo "  .ralph/ralph stop            Stop Ralph after the current iteration"
+  echo "  .ralph/ralph status          Print a human-readable project status report"
+  echo "  .ralph/ralph quick-status    Print a quick status summary (no LLM call)"
   exit 1
 }
 
@@ -246,6 +402,15 @@ fi
 
 MODE="$1"
 RALPH_DIR="$ROOT/.ralph"
+
+RECOVER=false
+MAX_ITERATIONS=0
+for arg in "${@:2}"; do
+  case "$arg" in
+    --recover) RECOVER=true ;;
+    [0-9]*) MAX_ITERATIONS="$arg" ;;
+  esac
+done
 
 if [ "$MODE" = "init" ]; then
   echo "Initializing Ralph project structure..."
@@ -382,10 +547,13 @@ if [ "$MODE" = "status" ]; then
   exit 0
 fi
 
-MAX_ITERATIONS="${2:-0}"
+if [ "$MODE" = "quick-status" ]; then
+  format_quick_status
+  exit 0
+fi
 
 if [ "$MODE" != "plan" ] && [ "$MODE" != "build" ]; then
-  echo "Error: mode must be 'init', 'plan', 'build', 'stop', or 'status'"
+  echo "Error: mode must be 'init', 'plan', 'build', 'stop', 'status', or 'quick-status'"
   usage
 fi
 
@@ -576,6 +744,14 @@ run_ralph() {
     $MAX_ITERATIONS_ARG \
     ralph
 }
+
+# Recover from a crashed iteration by discarding uncommitted changes
+if $RECOVER; then
+  echo "Recovering: discarding uncommitted changes..."
+  git -C "$ROOT" checkout -- . 2>/dev/null || true
+  git -C "$ROOT" clean -fd 2>/dev/null || true
+  rmdir "$ROOT/.ralph/.lock.d" 2>/dev/null || true
+fi
 
 # Build mode: scaffold and activate before launching the build loop.
 # Plan mode: just run the planner (it generates the manifest for next time).

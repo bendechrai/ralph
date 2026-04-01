@@ -189,7 +189,7 @@ No ports are mapped to the host. All HTTP access goes through devtun (Cloudflare
 
 ### How it works
 
-Each application stack lives in its own directory (e.g., `app/`, `api/`) with its own Dockerfile, docker-compose.yml, and env files.
+Each application stack lives in its own subdirectory (e.g., `web/`, `api/`) with its own Dockerfile, docker-compose.yml, and env files. Even single-stack projects use a subdirectory -- never `dir: .` -- to keep the project root clean for project-level files (specs, CLAUDE.md, IMPLEMENTATION_PLAN.md) and to avoid a disruptive reorganization if a second stack is added later.
 
 Infrastructure scaffolding is deterministic, not LLM-driven. The planner generates `.ralph/.stack-manifest.yml` (listing stacks, languages, and services) and `.ralph/.env-vars-needed` (listing required env vars). Before the first build, the host-side `ralph` script runs `.ralph/scaffold-infra`, which reads the manifest and stamps out all infrastructure files from templates. No LLM token cost, no risk of malformed YAML, no wasted iteration.
 
