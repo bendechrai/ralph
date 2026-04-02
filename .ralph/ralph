@@ -463,13 +463,17 @@ This project uses Ralph for autonomous building. See `.ralph/CLAUDE.md` for the 
   mkdir -p "$LOGS_DIR"
   echo "  Created .ralph/logs/"
 
-  # Ensure .ralph/.env is gitignored (holds CLAUDE_CODE_OAUTH_TOKEN)
+  # Ensure .ralph/.env and .ralph/logs/ are gitignored
   if [ ! -f "$ROOT/.gitignore" ]; then
-    echo ".ralph/.env" > "$ROOT/.gitignore"
+    printf '.ralph/.env\n.ralph/logs/\n' > "$ROOT/.gitignore"
     echo "  Created .gitignore"
-  elif ! grep -qF '.ralph/.env' "$ROOT/.gitignore"; then
-    echo ".ralph/.env" >> "$ROOT/.gitignore"
-    echo "  Added .ralph/.env to .gitignore"
+  else
+    for entry in '.ralph/.env' '.ralph/logs/'; do
+      if ! grep -qF "$entry" "$ROOT/.gitignore"; then
+        echo "$entry" >> "$ROOT/.gitignore"
+        echo "  Added $entry to .gitignore"
+      fi
+    done
   fi
 
   echo ""
